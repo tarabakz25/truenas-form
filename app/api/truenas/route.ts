@@ -38,11 +38,15 @@ const ONE_GB_IN_BYTES = 1024 * 1024 * 1024;
 const QUOTA_TIER_100GB = 100 * ONE_GB_IN_BYTES;
 const QUOTA_TIER_500GB = 500 * ONE_GB_IN_BYTES;
 const QUOTA_TIER_1TB = 1024 * ONE_GB_IN_BYTES;
-const QUOTA_TIER_LARGE = 10 * 1024 * ONE_GB_IN_BYTES; // 1TB超 (無制限の指定方法はAPI仕様を確認)
 const POOL_NAME = process.env.POOL_NAME || 'tank'; // 環境変数からプール名取得、なければ 'tank'
 
 // Helper function for API calls
-async function fetchTrueNASAPI(url: string, method: string, apiKey: string, body?: any) {
+async function fetchTrueNASAPI(
+  url: string,
+  method: string,
+  apiKey: string,
+  body?: TrueNASUserPayload | TrueNASDatasetPayload | TrueNASSetAclPayload | Record<string, unknown>
+) {
   const headers = {
     'Authorization': `Bearer ${apiKey}`,
     'Content-Type': 'application/json',
@@ -67,22 +71,29 @@ async function fetchTrueNASAPI(url: string, method: string, apiKey: string, body
 
   // ボディがない、または Content-Type が JSON でない場合があるため try-catch
   try {
+    // ステータスコード 204 (No Content) など、ボディがない場合を考慮
+    if (response.status === 204 || response.headers.get('content-length') === '0') {
+        console.log('TrueNAS API Response: No content.');
+        return null;
+    }
+    // Content-Type が application/json でない場合も考慮 (より厳密にするなら)
+    if (!response.headers.get('content-type')?.includes('application/json')) {
+        console.log('TrueNAS API Response: Not JSON.');
+        return await response.text(); // テキストとして返すか、null を返すかなど検討
+    }
     const responseData = await response.json();
     console.log('TrueNAS API Response:', responseData);
     return responseData;
   } catch (e) {
-    console.log('TrueNAS API Response: No JSON body or empty response.');
-    return null; // ボディがない、またはJSONでない場合は null を返す
+    // JSON解析エラーの場合 'e' をログに出力
+    console.error('Error parsing JSON response:', e);
+    throw new Error('Failed to parse TrueNAS API JSON response.'); // 新しいエラーをスロー
   }
 }
-
-// Helper function for delay
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export async function POST(request: NextRequest) {
   let datasetCreated = false;
   let supabaseLogged = false;
-  let userId = null; // TrueNAS APIから返されるユーザーIDを格納する変数 (ACLで使用する場合)
   let userCreated = false;
   let aclSet = false;
 
@@ -130,7 +141,7 @@ export async function POST(request: NextRequest) {
         } else {
             poolNameToUse = 'student-1000'; // 1TB超も student-1000 (要件確認)
             quotaInBytes = QUOTA_TIER_1TB;   // 1TB超のクォータ (要件確認)
-            console.warn(`Requested quota ${storageQuota}GB exceeds 1TB. Assigning to pool ${poolNameToUse} with quota ${quotaInBytes || 'unlimited'}. Review policy.`);
+            console.warn(`Requested quota ${storageQuota}GB exceeds 1TB. Assigning to pool ${poolNameToUse} with quota ${quotaInBytes}. Review policy.`);
         }
         console.log(`Storage quota ${storageQuota}GB maps to Pool: ${poolNameToUse}, Quota Bytes: ${quotaInBytes}`);
 
@@ -142,16 +153,28 @@ export async function POST(request: NextRequest) {
         const datasetMountPath = `/mnt/${datasetPath}`;
         homeDirectoryPath = datasetMountPath;
 
-        // --- 1a. データセット作成 ---
+        // --- 1a. データセット作成 (親データセット存在確認は未実装) ---
+        // TODO: 親データセット (e.g., student-50-100/users) の存在確認と作成ロジックを追加
         const datasetPayload: TrueNASDatasetPayload = { name: datasetPath, type: 'FILESYSTEM', quota: quotaInBytes };
         const datasetCreateUrl = `${truenasUrl}/api/v2.0/pool/dataset`;
         try {
              await fetchTrueNASAPI(datasetCreateUrl, 'POST', truenasApiKey, datasetPayload);
              console.log(`TrueNAS dataset ${datasetPath} created successfully.`);
              datasetCreated = true;
-        } catch (error) {
+        } catch (error: unknown) {
              console.error('Failed to create dataset, aborting user creation.', error);
-             throw new Error(`Failed to create prerequisite dataset ${datasetPath}. User not created.`);
+             // unknown 型なので、アクセス前に型ガードが必要
+             const errorMsg = error instanceof Error ? error.message : String(error);
+             if (errorMsg.includes("Parent dataset does not exist")) {
+                 // 親データセットが存在しない場合のエラーをスロー
+                 throw new Error(`Parent dataset for ${datasetPath} does not exist. Please create it first.`);
+             }
+             // その他のデータセット作成エラー
+             if (error instanceof Error) {
+                 throw new Error(`Failed to create prerequisite dataset ${datasetPath}. User not created. Original error: ${error.message}`);
+             } else {
+                 throw new Error(`Failed to create prerequisite dataset ${datasetPath}. User not created. Unknown error: ${String(error)}`);
+             }
         }
     }
 
@@ -166,8 +189,7 @@ export async function POST(request: NextRequest) {
     };
     if (homeDirectoryPath) { userPayload.home = homeDirectoryPath; }
     const userCreateUrl = `${truenasUrl}/api/v2.0/user`;
-    const userResponse = await fetchTrueNASAPI(userCreateUrl, 'POST', truenasApiKey, userPayload);
-    userId = userResponse?.id;
+    await fetchTrueNASAPI(userCreateUrl, 'POST', truenasApiKey, userPayload);
     console.log(`TrueNAS user ${name} created successfully.`);
     userCreated = true;
 
