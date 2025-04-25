@@ -78,7 +78,7 @@ const Home: React.FC = () => {
         <div>
           <label htmlFor="password" className="block text-sm font-medium text-gray-700">パスワード</label>
           <input
-            type="password"
+            type="text"
             id="password"
             name="password"
             value={form.password}
